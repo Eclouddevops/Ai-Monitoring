@@ -109,7 +109,7 @@ resource "aws_instance" "monitoring" {
     instance_index = count.index + 1
     instance_role  = local.instance_roles[count.index]
     environment    = var.environment
-    loki_url       = count.index == 0 ? "http://localhost:3100" : "http://${aws_eip.monitoring[0].public_ip}:3100"
+    loki_url       = "http://localhost:3100"
   })
 
   tags = {
@@ -125,11 +125,16 @@ resource "aws_instance" "monitoring" {
 }
 
 resource "aws_eip" "monitoring" {
-  count    = var.instance_count
-  instance = aws_instance.monitoring[count.index].id
-  domain   = "vpc"
+  count  = var.instance_count
+  domain = "vpc"
 
   tags = {
     Name = "${var.project_name}-eip-${count.index + 1}"
   }
+}
+
+resource "aws_eip_association" "monitoring" {
+  count         = var.instance_count
+  instance_id   = aws_instance.monitoring[count.index].id
+  allocation_id = aws_eip.monitoring[count.index].id
 }
