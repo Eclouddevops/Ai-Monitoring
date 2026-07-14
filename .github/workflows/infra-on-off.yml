@@ -1,0 +1,322 @@
+name: "Infrastructure On/Off Control"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What do you want to do?"
+        required: true
+        type: choice
+        options:
+          - "start - Turn ON instances"
+          - "stop - Turn OFF instances"
+          - "status - Check current state"
+          - "restart - Reboot instances"
+      target:
+        description: "Which instances?"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - monitoring-server
+          - app-servers
+          - instance-1
+          - instance-2
+          - instance-3
+      confirm:
+        description: "Type 'yes' to confirm (required for stop/restart)"
+        required: false
+        type: string
+        default: "yes"
+  
+  # Scheduled On/Off for cost saving
+  schedule:
+    # AUTO-START: Monday-Friday at 7:00 AM UTC (9:00 AM IST)
+    - cron: '0 7 * * 1-5'
+    # AUTO-STOP: Monday-Friday at 8:00 PM UTC (10:00 PM IST)
+    - cron: '0 20 * * 1-5'
+    # AUTO-STOP: Saturday-Sunday ALL DAY (stop at 9 AM if someone left them on)
+    - cron: '0 9 * * 0,6'
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_TAG: grafana-loki-monitoring
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Infrastructure On/Off Control
+  # ─────────────────────────────────────────────
+  infra-control:
+    name: "Infra Control"
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    
+    steps:
+      - name: Determine action
+        id: config
+        run: |
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            DAY=$(date -u +%u)  # 1=Mon, 7=Sun
+            HOUR=$(date -u +%H)
+            
+            if [ "$DAY" -ge 6 ]; then
+              # Weekend - always stop
+              echo "action=stop" >> $GITHUB_OUTPUT
+              echo "reason=Weekend auto-stop (cost saving)" >> $GITHUB_OUTPUT
+            elif [ "$HOUR" -lt 12 ]; then
+              echo "action=start" >> $GITHUB_OUTPUT
+              echo "reason=Weekday morning auto-start" >> $GITHUB_OUTPUT
+            else
+              echo "action=stop" >> $GITHUB_OUTPUT
+              echo "reason=Weekday evening auto-stop (cost saving)" >> $GITHUB_OUTPUT
+            fi
+            echo "target=all" >> $GITHUB_OUTPUT
+            echo "scheduled=true" >> $GITHUB_OUTPUT
+          else
+            # Extract action from choice (before the " - " description)
+            ACTION=$(echo "${{ github.event.inputs.action }}" | cut -d' ' -f1)
+            echo "action=$ACTION" >> $GITHUB_OUTPUT
+            echo "target=${{ github.event.inputs.target }}" >> $GITHUB_OUTPUT
+            echo "reason=Manual trigger by ${{ github.actor }}" >> $GITHUB_OUTPUT
+            echo "scheduled=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Safety check for destructive actions
+        if: steps.config.outputs.scheduled != 'true'
+        run: |
+          ACTION="${{ steps.config.outputs.action }}"
+          CONFIRM="${{ github.event.inputs.confirm }}"
+          
+          if [ "$ACTION" == "stop" ] || [ "$ACTION" == "restart" ]; then
+            if [ "$CONFIRM" != "yes" ]; then
+              echo "::error::You must type 'yes' in the confirm field to $ACTION instances"
+              exit 1
+            fi
+          fi
+          echo "Safety check passed for action: $ACTION"
+
+      - name: Get target instances
+        id: instances
+        run: |
+          TARGET="${{ steps.config.outputs.target }}"
+          
+          case "$TARGET" in
+            "all")
+              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }}"
+              ;;
+            "monitoring-server")
+              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }} Name=tag:Role,Values=monitoring-server"
+              ;;
+            "app-servers")
+              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }} Name=tag:Role,Values=app-server"
+              ;;
+            "instance-1")
+              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }} Name=tag:InstanceNum,Values=1"
+              ;;
+            "instance-2")
+              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }} Name=tag:InstanceNum,Values=2"
+              ;;
+            "instance-3")
+              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }} Name=tag:InstanceNum,Values=3"
+              ;;
+          esac
+          
+          # Get all instances (running + stopped)
+          RESULT=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --filters $FILTER "Name=instance-state-name,Values=running,stopped" \
+            --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,PublicIpAddress,Tags[?Key==`Name`].Value|[0],Tags[?Key==`Role`].Value|[0]]' \
+            --output json)
+          
+          echo "instances_json<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Get just IDs
+          IDS=$(echo "$RESULT" | jq -r '.[][0]' | tr '\n' ' ')
+          echo "instance_ids=$IDS" >> $GITHUB_OUTPUT
+          
+          RUNNING=$(echo "$RESULT" | jq -r '.[] | select(.[1]=="running") | .[0]' | tr '\n' ' ')
+          STOPPED=$(echo "$RESULT" | jq -r '.[] | select(.[1]=="stopped") | .[0]' | tr '\n' ' ')
+          echo "running_ids=$RUNNING" >> $GITHUB_OUTPUT
+          echo "stopped_ids=$STOPPED" >> $GITHUB_OUTPUT
+          
+          RUNNING_COUNT=$(echo "$RESULT" | jq '[.[] | select(.[1]=="running")] | length')
+          STOPPED_COUNT=$(echo "$RESULT" | jq '[.[] | select(.[1]=="stopped")] | length')
+          TOTAL=$(echo "$RESULT" | jq 'length')
+          echo "running_count=$RUNNING_COUNT" >> $GITHUB_OUTPUT
+          echo "stopped_count=$STOPPED_COUNT" >> $GITHUB_OUTPUT
+          echo "total_count=$TOTAL" >> $GITHUB_OUTPUT
+          
+          echo "Found $TOTAL instances ($RUNNING_COUNT running, $STOPPED_COUNT stopped)"
+
+      - name: "Action: START instances"
+        if: steps.config.outputs.action == 'start'
+        run: |
+          STOPPED_IDS="${{ steps.instances.outputs.stopped_ids }}"
+          
+          if [ -z "$STOPPED_IDS" ]; then
+            echo "ℹ️ No stopped instances to start. All instances are already running."
+            exit 0
+          fi
+          
+          echo "🟢 Starting instances: $STOPPED_IDS"
+          aws ec2 start-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $STOPPED_IDS
+          
+          echo ""
+          echo "⏳ Waiting for instances to reach 'running' state..."
+          aws ec2 wait instance-running \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $STOPPED_IDS
+          
+          echo "✅ All instances are now RUNNING"
+          
+          # Show new IPs
+          echo ""
+          echo "📍 Instance Public IPs:"
+          aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $STOPPED_IDS \
+            --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],PublicIpAddress]' \
+            --output table
+
+      - name: "Action: STOP instances"
+        if: steps.config.outputs.action == 'stop'
+        run: |
+          RUNNING_IDS="${{ steps.instances.outputs.running_ids }}"
+          
+          if [ -z "$RUNNING_IDS" ]; then
+            echo "ℹ️ No running instances to stop. All instances are already stopped."
+            exit 0
+          fi
+          
+          echo "🔴 Stopping instances: $RUNNING_IDS"
+          echo "   Reason: ${{ steps.config.outputs.reason }}"
+          
+          aws ec2 stop-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $RUNNING_IDS
+          
+          echo ""
+          echo "⏳ Waiting for instances to stop..."
+          aws ec2 wait instance-stopped \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $RUNNING_IDS
+          
+          echo "✅ All instances are now STOPPED"
+          echo "💰 Compute charges paused (EBS storage charges still apply)"
+
+      - name: "Action: RESTART instances"
+        if: steps.config.outputs.action == 'restart'
+        run: |
+          RUNNING_IDS="${{ steps.instances.outputs.running_ids }}"
+          
+          if [ -z "$RUNNING_IDS" ]; then
+            echo "ℹ️ No running instances to restart."
+            exit 0
+          fi
+          
+          echo "🔄 Restarting instances: $RUNNING_IDS"
+          aws ec2 reboot-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $RUNNING_IDS
+          
+          echo "⏳ Waiting for reboot..."
+          sleep 30
+          
+          echo "✅ Reboot initiated for all instances"
+
+      - name: "Action: STATUS check"
+        if: steps.config.outputs.action == 'status'
+        run: |
+          echo "📊 Infrastructure Status Report"
+          echo "================================"
+          echo ""
+          
+          aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],InstanceId,State.Name,InstanceType,PublicIpAddress,LaunchTime]' \
+            --output table
+
+      - name: Cost estimate
+        run: |
+          RUNNING="${{ steps.instances.outputs.running_count }}"
+          TOTAL="${{ steps.instances.outputs.total_count }}"
+          
+          # t3.medium approximate pricing
+          HOURLY_RATE="0.0416"
+          DAILY=$(echo "$RUNNING * $HOURLY_RATE * 24" | bc 2>/dev/null || echo "N/A")
+          MONTHLY=$(echo "$RUNNING * $HOURLY_RATE * 720" | bc 2>/dev/null || echo "N/A")
+          
+          echo ""
+          echo "💰 Cost Estimate (after this action):"
+          
+          ACTION="${{ steps.config.outputs.action }}"
+          if [ "$ACTION" == "stop" ]; then
+            echo "   Running instances: 0 / $TOTAL"
+            echo "   Daily cost: ~\$0.00 (compute)"
+            echo "   Monthly savings: ~\$$MONTHLY"
+          elif [ "$ACTION" == "start" ]; then
+            echo "   Running instances: $TOTAL / $TOTAL"
+            DAILY_ALL=$(echo "$TOTAL * $HOURLY_RATE * 24" | bc 2>/dev/null || echo "N/A")
+            MONTHLY_ALL=$(echo "$TOTAL * $HOURLY_RATE * 720" | bc 2>/dev/null || echo "N/A")
+            echo "   Daily cost: ~\$$DAILY_ALL"
+            echo "   Monthly cost: ~\$$MONTHLY_ALL"
+          else
+            echo "   Currently running: $RUNNING / $TOTAL"
+            echo "   Current daily cost: ~\$$DAILY"
+            echo "   Current monthly cost: ~\$$MONTHLY"
+          fi
+
+      - name: Generate summary
+        if: always()
+        run: |
+          ACTION="${{ steps.config.outputs.action }}"
+          TARGET="${{ steps.config.outputs.target }}"
+          REASON="${{ steps.config.outputs.reason }}"
+          RUNNING="${{ steps.instances.outputs.running_count }}"
+          STOPPED="${{ steps.instances.outputs.stopped_count }}"
+          TOTAL="${{ steps.instances.outputs.total_count }}"
+          
+          # Determine emoji
+          case "$ACTION" in
+            "start") EMOJI="🟢" ;;
+            "stop") EMOJI="🔴" ;;
+            "restart") EMOJI="🔄" ;;
+            "status") EMOJI="📊" ;;
+          esac
+          
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          
+          ## $EMOJI Infrastructure Control: $ACTION
+          
+          | Parameter | Value |
+          |-----------|-------|
+          | **Action** | $ACTION |
+          | **Target** | $TARGET |
+          | **Reason** | $REASON |
+          | **Triggered by** | ${{ github.actor }} |
+          | **Timestamp** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
+          
+          ### Instance Summary
+          | Metric | Count |
+          |--------|-------|
+          | Total instances | $TOTAL |
+          | Running (before) | $RUNNING |
+          | Stopped (before) | $STOPPED |
+          
+          ### Schedule
+          | Day | Start | Stop |
+          |-----|-------|------|
+          | Mon-Fri | 7:00 AM UTC | 8:00 PM UTC |
+          | Sat-Sun | ❌ Off | ❌ Off |
+          
+          ---
+          *Run this workflow manually: Actions → Infrastructure On/Off Control → Run workflow*
+          EOF
