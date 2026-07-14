@@ -19,7 +19,8 @@ apt-get install -y \
   lsb-release \
   unzip \
   jq \
-  htop
+  htop \
+  git
 
 # ==========================================
 # Install Docker
@@ -46,10 +47,10 @@ curl -L "https://github.com/docker/compose/releases/download/$${DOCKER_COMPOSE_V
 chmod +x /usr/local/bin/docker-compose
 
 # ==========================================
-# Install Node.js 18
+# Install Node.js 22
 # ==========================================
-echo "=== Installing Node.js 18 ==="
-curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+echo "=== Installing Node.js 22 ==="
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y nodejs
 
 # ==========================================
@@ -60,6 +61,14 @@ curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv
 unzip -q /tmp/awscliv2.zip -d /tmp
 /tmp/aws/install
 rm -rf /tmp/aws /tmp/awscliv2.zip
+
+# ==========================================
+# Install SSM Agent (for Session Manager - no SSH key needed)
+# ==========================================
+echo "=== Installing SSM Agent ==="
+snap install amazon-ssm-agent --classic 2>/dev/null || true
+systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null || true
+systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null || true
 
 # ==========================================
 # Install Node Exporter
@@ -95,11 +104,23 @@ systemctl enable node_exporter
 systemctl start node_exporter
 
 # ==========================================
-# Setup Application Directory
+# Clone Application Repository
 # ==========================================
-echo "=== Setting up application directory ==="
+echo "=== Cloning application repository ==="
 mkdir -p /opt/monitoring-app
-chown ubuntu:ubuntu /opt/monitoring-app
+cd /opt/monitoring-app
+
+git clone https://github.com/Eclouddevops/Ai-Monitoring.git /tmp/app-repo
+
+# Copy monitoring stack files
+cp -r /tmp/app-repo/monitoring/* /opt/monitoring-app/
+cp -r /tmp/app-repo/nodejs-app /opt/monitoring-app/nodejs-app
+cp -r /tmp/app-repo/scripts /opt/monitoring-app/scripts
+
+# Clean up
+rm -rf /tmp/app-repo
+
+chown -R ubuntu:ubuntu /opt/monitoring-app
 
 # ==========================================
 # Set Environment Variables
@@ -112,6 +133,8 @@ ENVIRONMENT=${environment}
 LOKI_HOST=${loki_url}
 NODE_ENV=${environment}
 PORT=3000
+GRAFANA_ADMIN_USER=admin
+GRAFANA_ADMIN_PASSWORD=admin123
 EOF
 
 # Add environment variables to ubuntu user profile
@@ -125,9 +148,54 @@ export LOKI_HOST=${loki_url}
 EOF
 
 # ==========================================
-# Create Monitoring App Systemd Service
+# Build and Start Docker Containers
 # ==========================================
-echo "=== Creating monitoring app service ==="
+echo "=== Building and starting monitoring stack ==="
+cd /opt/monitoring-app
+
+# Build the Node.js app image
+docker build -t nodejs-loki-app:latest /opt/monitoring-app/nodejs-app/
+
+# Start all services
+docker-compose up -d
+
+echo "=== Waiting for services to start ==="
+sleep 15
+
+# ==========================================
+# Health Check
+# ==========================================
+echo "=== Running health checks ==="
+
+check_service() {
+    local name=$$1
+    local url=$$2
+    local max_attempts=5
+    local attempt=1
+
+    while [ $$attempt -le $$max_attempts ]; do
+        HTTP_CODE=$$(curl -s -o /dev/null -w "%%{http_code}" "$$url" 2>/dev/null || echo "000")
+        if [ "$$HTTP_CODE" -ge 200 ] && [ "$$HTTP_CODE" -lt 400 ]; then
+            echo "  ✅ $$name - OK (HTTP $$HTTP_CODE)"
+            return 0
+        fi
+        echo "  ⏳ $$name - Attempt $$attempt/$$max_attempts (HTTP $$HTTP_CODE)"
+        sleep 5
+        attempt=$$((attempt + 1))
+    done
+    echo "  ❌ $$name - FAILED after $$max_attempts attempts"
+    return 1
+}
+
+check_service "Node.js App" "http://localhost:3000/health"
+check_service "Grafana" "http://localhost:3001/api/health"
+check_service "Loki" "http://localhost:3100/ready"
+check_service "Prometheus" "http://localhost:9090/-/healthy"
+
+# ==========================================
+# Create Monitoring App Systemd Service (auto-restart on reboot)
+# ==========================================
+echo "=== Creating auto-start service ==="
 cat > /etc/systemd/system/monitoring-app.service <<EOF
 [Unit]
 Description=Monitoring Application Stack
@@ -140,8 +208,11 @@ RemainAfterExit=yes
 WorkingDirectory=/opt/monitoring-app
 ExecStart=/usr/local/bin/docker-compose up -d
 ExecStop=/usr/local/bin/docker-compose down
-User=ubuntu
+ExecReload=/usr/local/bin/docker-compose restart
+User=root
 Group=docker
+Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -150,4 +221,23 @@ EOF
 systemctl daemon-reload
 systemctl enable monitoring-app
 
-echo "=== Instance setup complete (Instance ${instance_index}, Role: ${instance_role}) ==="
+# ==========================================
+# Setup Complete
+# ==========================================
+PUBLIC_IP=$$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "N/A")
+
+echo ""
+echo "=========================================="
+echo "  INSTANCE SETUP COMPLETE!"
+echo "=========================================="
+echo ""
+echo "  Instance: ${instance_index} (${instance_role})"
+echo "  Public IP: $$PUBLIC_IP"
+echo ""
+echo "  Services:"
+echo "    Node.js App:  http://$$PUBLIC_IP:3000"
+echo "    Grafana:      http://$$PUBLIC_IP:3001  (admin/admin123)"
+echo "    Prometheus:   http://$$PUBLIC_IP:9090"
+echo "    Loki:         http://$$PUBLIC_IP:3100"
+echo ""
+echo "=========================================="

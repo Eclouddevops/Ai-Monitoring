@@ -1,0 +1,171 @@
+name: "EC2 Start / Stop"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Select Action"
+        required: true
+        type: choice
+        options:
+          - START All Instances
+          - STOP All Instances
+          - STATUS Check
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_TAG: grafana-loki-monitoring
+
+jobs:
+  ec2-manage:
+    name: "${{ github.event.inputs.action }}"
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    steps:
+      - name: Get all project instances
+        id: instances
+        run: |
+          echo "Fetching instances with tag Project=${{ env.PROJECT_TAG }}..."
+          
+          ALL_IDS=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" "Name=instance-state-name,Values=running,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+          
+          RUNNING_IDS=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+          
+          STOPPED_IDS=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" "Name=instance-state-name,Values=stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+          
+          echo "all_ids=$ALL_IDS" >> $GITHUB_OUTPUT
+          echo "running_ids=$RUNNING_IDS" >> $GITHUB_OUTPUT
+          echo "stopped_ids=$STOPPED_IDS" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "All instances: $ALL_IDS"
+          echo "Running: $RUNNING_IDS"
+          echo "Stopped: $STOPPED_IDS"
+
+      - name: "START All Instances"
+        if: github.event.inputs.action == 'START All Instances'
+        run: |
+          IDS="${{ steps.instances.outputs.stopped_ids }}"
+          
+          if [ -z "$IDS" ]; then
+            echo "All instances are already running. Nothing to start."
+            exit 0
+          fi
+          
+          echo "=========================================="
+          echo "  STARTING EC2 INSTANCES"
+          echo "=========================================="
+          echo "  Instances: $IDS"
+          echo ""
+          
+          aws ec2 start-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $IDS
+          
+          echo "Waiting for instances to be running..."
+          aws ec2 wait instance-running \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $IDS
+          
+          echo ""
+          echo "=========================================="
+          echo "  ALL INSTANCES STARTED SUCCESSFULLY!"
+          echo "=========================================="
+          echo ""
+          echo "Instance IPs:"
+          aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $IDS \
+            --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],PublicIpAddress,State.Name]' \
+            --output table
+          
+          echo ""
+          echo "Wait 2-3 minutes for Docker services to auto-start, then access:"
+          echo "  Grafana:  http://<IP>:3001  (admin/admin123)"
+          echo "  App:      http://<IP>:3000"
+
+      - name: "STOP All Instances"
+        if: github.event.inputs.action == 'STOP All Instances'
+        run: |
+          IDS="${{ steps.instances.outputs.running_ids }}"
+          
+          if [ -z "$IDS" ]; then
+            echo "All instances are already stopped. Nothing to stop."
+            exit 0
+          fi
+          
+          echo "=========================================="
+          echo "  STOPPING EC2 INSTANCES"
+          echo "=========================================="
+          echo "  Instances: $IDS"
+          echo ""
+          
+          aws ec2 stop-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $IDS
+          
+          echo "Waiting for instances to stop..."
+          aws ec2 wait instance-stopped \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $IDS
+          
+          echo ""
+          echo "=========================================="
+          echo "  ALL INSTANCES STOPPED SUCCESSFULLY!"
+          echo "=========================================="
+          echo ""
+          echo "  Compute charges PAUSED (EBS storage still applies)"
+          echo "  Run 'START All Instances' to bring them back up"
+
+      - name: "STATUS Check"
+        if: github.event.inputs.action == 'STATUS Check'
+        run: |
+          echo "=========================================="
+          echo "  EC2 INSTANCE STATUS"
+          echo "=========================================="
+          echo ""
+          
+          aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],InstanceId,State.Name,InstanceType,PublicIpAddress]' \
+            --output table
+
+      - name: Summary
+        if: always()
+        run: |
+          ACTION="${{ github.event.inputs.action }}"
+          
+          echo "## EC2 $ACTION" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | $ACTION |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Current State:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],State.Name,PublicIpAddress]' \
+            --output table >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "Unable to fetch status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

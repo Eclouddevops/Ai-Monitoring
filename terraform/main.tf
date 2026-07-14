@@ -9,10 +9,11 @@ terraform {
   }
 
   backend "s3" {
-    bucket  = "grafana-loki-ec2-tfstate"
-    key     = "terraform.tfstate"
-    region  = "us-east-1"
-    encrypt = true
+    bucket         = "ai-monitoring-tfstate-496251222247"
+    key            = "terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    dynamodb_table = "ai-monitoring-tf-locks"
   }
 }
 

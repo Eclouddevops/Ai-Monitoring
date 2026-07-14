@@ -58,13 +58,9 @@ resource "aws_iam_role_policy" "ec2_policy" {
       {
         Effect = "Allow"
         Action = [
-          "ssm:GetParameter",
-          "ssm:GetParameters",
-          "ssm:GetParametersByPath",
-          "ssmmessages:CreateControlChannel",
-          "ssmmessages:CreateDataChannel",
-          "ssmmessages:OpenControlChannel",
-          "ssmmessages:OpenDataChannel"
+          "ssm:*",
+          "ssmmessages:*",
+          "ec2messages:*"
         ]
         Resource = "*"
       },
@@ -78,6 +74,12 @@ resource "aws_iam_role_policy" "ec2_policy" {
       }
     ]
   })
+}
+
+# Attach AWS managed SSM policy for Session Manager
+resource "aws_iam_role_policy_attachment" "ssm_policy" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_instance_profile" "ec2_profile" {
