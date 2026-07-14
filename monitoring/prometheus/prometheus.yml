@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          instance: 'prometheus'
+
+  - job_name: 'nodejs-app'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['nodejs-app:3000']
+        labels:
+          app: 'nodejs-app'
+          environment: 'production'
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          instance: 'node-exporter'
+
+  - job_name: 'ec2-instances'
+    file_sd_configs:
+      - files:
+          - '/etc/prometheus/file_sd/*.json'
+        refresh_interval: 30s

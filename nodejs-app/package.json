@@ -1,0 +1,24 @@
+{
+  "name": "nodejs-loki-app",
+  "version": "1.0.0",
+  "description": "Node.js application with Grafana Loki logging",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "echo \"No tests\" && exit 0"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "winston": "^3.11.0",
+    "winston-loki": "^6.0.8",
+    "dotenv": "^16.3.1",
+    "prom-client": "^15.1.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
