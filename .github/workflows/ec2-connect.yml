@@ -1,0 +1,105 @@
+name: "EC2 Connect & Debug"
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: "Which instance to connect to"
+        required: true
+        type: choice
+        options:
+          - instance-1 (monitoring)
+          - instance-2 (app)
+          - instance-3 (app)
+      command:
+        description: "Command to run on the instance"
+        required: true
+        default: "docker ps && echo '---' && curl -s localhost:3000/health && echo '---' && curl -s localhost:3001/api/health"
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_TAG: grafana-loki-monitoring
+
+jobs:
+  run-command:
+    name: "Run on ${{ github.event.inputs.instance }}"
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    steps:
+      - name: Get instance ID
+        id: instance
+        run: |
+          NUM=$(echo "${{ github.event.inputs.instance }}" | grep -o '[0-9]')
+          
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+              "Name=tag:InstanceNum,Values=$NUM" \
+              "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+          
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "::error::Instance not found or not running!"
+            exit 1
+          fi
+          
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "Found instance: $INSTANCE_ID"
+
+      - name: Run command via SSM
+        run: |
+          echo "=========================================="
+          echo "  Running command on: ${{ github.event.inputs.instance }}"
+          echo "  Instance ID: ${{ steps.instance.outputs.instance_id }}"
+          echo "=========================================="
+          echo ""
+          
+          COMMAND_ID=$(aws ssm send-command \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids "${{ steps.instance.outputs.instance_id }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"${{ github.event.inputs.command }}\"]" \
+            --query 'Command.CommandId' \
+            --output text)
+          
+          echo "Command ID: $COMMAND_ID"
+          echo "Waiting for completion..."
+          
+          sleep 5
+          for i in $(seq 1 12); do
+            STATUS=$(aws ssm get-command-invocation \
+              --region ${{ env.AWS_REGION }} \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ steps.instance.outputs.instance_id }}" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            
+            if [ "$STATUS" == "Success" ] || [ "$STATUS" == "Failed" ]; then
+              break
+            fi
+            sleep 5
+          done
+          
+          echo ""
+          echo "=== OUTPUT ==="
+          aws ssm get-command-invocation \
+            --region ${{ env.AWS_REGION }} \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ steps.instance.outputs.instance_id }}" \
+            --query 'StandardOutputContent' --output text
+          
+          ERRORS=$(aws ssm get-command-invocation \
+            --region ${{ env.AWS_REGION }} \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ steps.instance.outputs.instance_id }}" \
+            --query 'StandardErrorContent' --output text)
+          
+          if [ -n "$ERRORS" ] && [ "$ERRORS" != "None" ]; then
+            echo ""
+            echo "=== ERRORS ==="
+            echo "$ERRORS"
+          fi
