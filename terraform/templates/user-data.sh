@@ -63,6 +63,14 @@ unzip -q /tmp/awscliv2.zip -d /tmp
 rm -rf /tmp/aws /tmp/awscliv2.zip
 
 # ==========================================
+# Install SSM Agent (for Session Manager - no SSH key needed)
+# ==========================================
+echo "=== Installing SSM Agent ==="
+snap install amazon-ssm-agent --classic 2>/dev/null || true
+systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null || true
+systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null || true
+
+# ==========================================
 # Install Node Exporter
 # ==========================================
 echo "=== Installing Node Exporter ==="
