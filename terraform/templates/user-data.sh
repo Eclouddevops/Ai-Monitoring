@@ -166,7 +166,7 @@ check_service() {
     local attempt=1
 
     while [ $$attempt -le $$max_attempts ]; do
-        HTTP_CODE=$$(curl -s -o /dev/null -w "%{http_code}" "$$url" 2>/dev/null || echo "000")
+        HTTP_CODE=$$(curl -s -o /dev/null -w "%%{http_code}" "$$url" 2>/dev/null || echo "000")
         if [ "$$HTTP_CODE" -ge 200 ] && [ "$$HTTP_CODE" -lt 400 ]; then
             echo "  ✅ $$name - OK (HTTP $$HTTP_CODE)"
             return 0
