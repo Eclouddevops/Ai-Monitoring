@@ -19,7 +19,13 @@ on:
         options:
           - plan
           - apply
+          - apply-from-snapshot
           - destroy
+      confirm_destroy:
+        description: "Type 'yes' to confirm destroy/restore (safety check)"
+        required: false
+        type: string
+        default: ""
 
 env:
   TF_VAR_key_pair_name: ${{ secrets.AWS_KEY_PAIR_NAME }}
@@ -202,6 +208,13 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
     steps:
+      - name: Safety check
+        run: |
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "yes" ]; then
+            echo "::error::You must type 'yes' in confirm_destroy field to destroy infrastructure!"
+            exit 1
+          fi
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -209,6 +222,31 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.0
+
+      - name: Create snapshot before destroy
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=grafana-loki-monitoring" "Name=instance-state-name,Values=running,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+            VOLUME_ID=$(aws ec2 describe-instances --region ${{ env.AWS_REGION }} \
+              --instance-ids $INSTANCE_ID \
+              --query 'Reservations[].Instances[].BlockDeviceMappings[0].Ebs.VolumeId' --output text)
+            
+            echo "Creating snapshot before destroy (Volume: $VOLUME_ID)..."
+            SNAPSHOT_ID=$(aws ec2 create-snapshot --region ${{ env.AWS_REGION }} \
+              --volume-id "$VOLUME_ID" \
+              --description "pre-destroy-backup-$(date -u +%Y%m%d-%H%M%S)" \
+              --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=pre-destroy-backup},{Key=Project,Value=grafana-loki-monitoring},{Key=Type,Value=pre-destroy}]" \
+              --query 'SnapshotId' --output text)
+            echo "Snapshot created: $SNAPSHOT_ID (waiting for completion...)"
+            aws ec2 wait snapshot-completed --region ${{ env.AWS_REGION }} --snapshot-ids $SNAPSHOT_ID
+            echo "Snapshot ready! You can restore from this later using 'apply-from-snapshot'."
+          else
+            echo "No running instance found. Skipping snapshot."
+          fi
 
       - name: Clear stale locks
         run: |
@@ -224,3 +262,115 @@ jobs:
       - name: Terraform Destroy
         working-directory: terraform
         run: terraform destroy -auto-approve -lock=false
+
+  apply-from-snapshot:
+    name: Apply from Latest Snapshot
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply-from-snapshot'
+    environment: production
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Safety check
+        run: |
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "yes" ]; then
+            echo "::error::You must type 'yes' in confirm field to restore from snapshot!"
+            echo ""
+            echo "This will:"
+            echo "  1. Find the latest snapshot"
+            echo "  2. Create an AMI from it"
+            echo "  3. Deploy infrastructure using that AMI"
+            echo "  4. Your previous data/configs will be restored"
+            exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Get latest snapshot and create AMI
+        id: snapshot
+        run: |
+          echo "Finding latest snapshot..."
+          SNAPSHOT_ID=$(aws ec2 describe-snapshots \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=grafana-loki-monitoring" \
+            --query 'Snapshots | sort_by(@, &StartTime) | reverse(@) | [0].SnapshotId' \
+            --output text)
+          
+          if [ -z "$SNAPSHOT_ID" ] || [ "$SNAPSHOT_ID" == "None" ]; then
+            echo "::error::No snapshots found! Run 'Create Snapshot' workflow first."
+            exit 1
+          fi
+          
+          SNAPSHOT_DATE=$(aws ec2 describe-snapshots --region ${{ env.AWS_REGION }} \
+            --snapshot-ids $SNAPSHOT_ID \
+            --query 'Snapshots[0].StartTime' --output text)
+          
+          echo "Latest snapshot: $SNAPSHOT_ID (created: $SNAPSHOT_DATE)"
+          echo ""
+          echo "Creating AMI from snapshot..."
+          
+          AMI_ID=$(aws ec2 register-image \
+            --region ${{ env.AWS_REGION }} \
+            --name "ai-monitoring-restored-$(date -u +%Y%m%d-%H%M%S)" \
+            --description "Restored from snapshot $SNAPSHOT_ID" \
+            --architecture x86_64 \
+            --root-device-name /dev/sda1 \
+            --virtualization-type hvm \
+            --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"SnapshotId\":\"$SNAPSHOT_ID\",\"VolumeSize\":30,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
+            --query 'ImageId' --output text)
+          
+          echo "AMI created: $AMI_ID"
+          echo "Waiting for AMI to be available..."
+          aws ec2 wait image-available --region ${{ env.AWS_REGION }} --image-ids $AMI_ID
+          echo "AMI ready!"
+          
+          echo "ami_id=$AMI_ID" >> $GITHUB_OUTPUT
+          echo "snapshot_id=$SNAPSHOT_ID" >> $GITHUB_OUTPUT
+
+      - name: Clear stale locks
+        run: |
+          aws dynamodb delete-item \
+            --table-name ai-monitoring-tf-locks \
+            --key '{"LockID":{"S":"ai-monitoring-tfstate-496251222247/terraform.tfstate"}}' \
+            --region us-east-1 2>/dev/null || true
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Apply with Snapshot AMI
+        working-directory: terraform
+        run: |
+          echo "Deploying infrastructure using snapshot AMI: ${{ steps.snapshot.outputs.ami_id }}"
+          terraform apply -auto-approve \
+            -var="ami_id=${{ steps.snapshot.outputs.ami_id }}" \
+            -lock=false
+
+      - name: Show Access Info
+        run: |
+          cd terraform && terraform init > /dev/null 2>&1
+          
+          IP=$(terraform output -raw public_ip 2>/dev/null || echo "pending")
+          
+          echo ""
+          echo "==========================================="
+          echo "  INFRASTRUCTURE RESTORED FROM SNAPSHOT!"
+          echo "==========================================="
+          echo ""
+          echo "  Snapshot: ${{ steps.snapshot.outputs.snapshot_id }}"
+          echo "  AMI:      ${{ steps.snapshot.outputs.ami_id }}"
+          echo "  IP:       $IP"
+          echo ""
+          echo "  Grafana:     http://$IP:3001 (admin/admin123)"
+          echo "  App:         http://$IP:3000"
+          echo "  Prometheus:  http://$IP:9090"
+          echo ""
+          echo "  All previous data and configs are restored!"
+          echo "==========================================="
