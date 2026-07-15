@@ -1,399 +1,254 @@
 # Usage Guide — Ai-Monitoring Stack
 
-## Table of Contents
-- [After Deployment — How to Access](#after-deployment--how-to-access)
-- [Service URLs & Ports](#service-urls--ports)
-- [Using Grafana](#using-grafana)
-- [Using the Node.js Application](#using-the-nodejs-application)
-- [Viewing Logs in Grafana (Loki)](#viewing-logs-in-grafana-loki)
-- [Prometheus Metrics](#prometheus-metrics)
-- [EC2 On/Off Control](#ec2-onoff-control)
-- [SSH Access](#ssh-access)
-- [Architecture](#architecture)
-- [Cost Estimation](#cost-estimation)
-- [Troubleshooting](#troubleshooting)
+## What This Application Does
+
+This is a **complete monitoring solution** running on a single AWS EC2 instance:
+
+- **Grafana** — Beautiful dashboards for visualizing metrics and logs
+- **Prometheus** — Collects and stores metrics (CPU, memory, HTTP requests)
+- **Loki** — Collects and stores application logs
+- **Node.js App** — Sample application generating logs and metrics
+- **Node Exporter** — System-level metrics (CPU, memory, disk)
+
+Everything runs in **Docker containers** and **auto-starts** on boot.
 
 ---
 
-## After Deployment — How to Access
+## Quick Access (after deployment)
 
-Once you run the pipeline with `apply` (Actions → Deploy Infrastructure → Run workflow → `apply`), 3 EC2 instances will be created.
+| Service | URL | Login |
+|---------|-----|-------|
+| **Grafana** | `http://<YOUR_IP>:3001` | admin / admin123 |
+| **Node.js App** | `http://<YOUR_IP>:3000` | No login |
+| **Prometheus** | `http://<YOUR_IP>:9090` | No login |
+| **App Health** | `http://<YOUR_IP>:3000/health` | No login |
 
-### Get the IP Addresses
+---
 
-After terraform apply completes, check the outputs:
+## How to Get Your IP
 
-```
-Outputs:
-  monitoring_server_ip = "54.x.x.x"
-  instance_public_ips  = ["54.x.x.x", "3.x.x.x", "18.x.x.x"]
-  grafana_url          = "http://54.x.x.x:3001"
-```
+### Option A: GitHub Actions output
+After running `START` or `apply`, the workflow shows the IP in its output.
 
-**Or via AWS Console:**
-1. Go to: https://console.aws.amazon.com/ec2/
-2. Region: **us-east-1**
-3. Look for instances named: `grafana-loki-monitoring-instance-1/2/3`
-
-**Or via CLI:**
+### Option B: AWS CLI
 ```bash
 aws ec2 describe-instances \
-  --filters "Name=tag:Project,Values=grafana-loki-monitoring" \
-  --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],PublicIpAddress,State.Name]' \
-  --output table --region us-east-1
+  --filters "Name=tag:Project,Values=grafana-loki-monitoring" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].PublicIpAddress' \
+  --output text --region us-east-1
+```
+
+### Option C: AWS Console
+1. Go to https://console.aws.amazon.com/ec2/
+2. Click **Instances**
+3. Find `grafana-loki-monitoring-server`
+4. Copy the **Public IPv4 address**
+
+---
+
+## Using Grafana (Dashboards)
+
+### Step 1: Open Grafana
+```
+http://<YOUR_IP>:3001
+```
+
+### Step 2: Login
+- Username: `admin`
+- Password: `admin123`
+
+### Step 3: View Dashboards
+1. Click the **Dashboards** icon (4 squares) in the left sidebar
+2. Click a dashboard:
+   - **Node.js Application Dashboard** — Shows HTTP request rates, latency, active connections, and application logs
+   - **EC2 Infrastructure Dashboard** — Shows CPU, memory, disk usage, and network traffic
+
+### Step 4: Explore Logs
+1. Click the **Explore** icon (compass) in the left sidebar
+2. Select **Loki** from the data source dropdown at the top
+3. Enter: `{app="nodejs-app"}`
+4. Click **Run query**
+5. You'll see all application logs in real-time!
+
+### Step 5: Generate Dashboard Data
+Run these from your local machine to create activity:
+```bash
+IP=<YOUR_IP>
+for i in $(seq 1 30); do
+  curl -s http://$IP:3000/api/users > /dev/null
+  curl -s http://$IP:3000/api/orders -X POST -H "Content-Type: application/json" -d '{"items":["test"]}' > /dev/null
+  curl -s http://$IP:3000/api/error > /dev/null
+  curl -s http://$IP:3000/api/slow > /dev/null
+done
+echo "Done! Refresh Grafana dashboards to see data."
 ```
 
 ---
 
-## Service URLs & Ports
+## Using Prometheus (Metrics)
 
-| Service | URL | Port | Credentials |
-|---------|-----|------|-------------|
-| **Grafana** (Dashboards) | `http://<MONITORING_IP>:3001` | 3001 | admin / admin123 |
-| **Prometheus** (Metrics) | `http://<MONITORING_IP>:9090` | 9090 | No auth |
-| **Loki** (Logs API) | `http://<MONITORING_IP>:3100` | 3100 | No auth |
-| **Node.js App** | `http://<ANY_IP>:3000` | 3000 | No auth |
-| **Node Exporter** | `http://<ANY_IP>:9100/metrics` | 9100 | No auth |
+### Access
+```
+http://<YOUR_IP>:9090
+```
 
-> **Note:** Replace `<MONITORING_IP>` with Instance 1's public IP, and `<ANY_IP>` with any instance's public IP.
+### Check What's Being Monitored
+1. Click **Status** → **Targets** in the top menu
+2. You should see all targets as `UP` (green):
+   - `prometheus` — Self-monitoring
+   - `nodejs-app` — Application metrics
+   - `node-exporter` — System metrics
+
+### Run a Query
+1. Type in the **Expression** box at the top
+2. Click **Execute**
+3. Switch between **Table** and **Graph** tabs
+
+### Useful Queries
+
+| Query | What it shows |
+|-------|--------------|
+| `up` | Which services are healthy |
+| `rate(http_requests_total[5m])` | HTTP requests per second |
+| `active_connections` | Current active connections |
+| `process_resident_memory_bytes / 1024 / 1024` | App memory (MB) |
+| `100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)` | Server CPU % |
 
 ---
 
-## Using Grafana
+## Using the Node.js App
 
-### Login
-1. Open browser: `http://<MONITORING_IP>:3001`
-2. Username: **admin**
-3. Password: **admin123**
-4. (Optional: Change password on first login)
+### API Endpoints
 
-### Pre-Built Dashboards
-Go to **Dashboards** in the left sidebar. Two dashboards are included:
+| URL | Method | What it does |
+|-----|--------|-------------|
+| `http://<IP>:3000/` | GET | App info and available endpoints |
+| `http://<IP>:3000/health` | GET | Health check (status, uptime) |
+| `http://<IP>:3000/api/users` | GET | Returns sample user list |
+| `http://<IP>:3000/api/orders` | POST | Creates an order (generates logs) |
+| `http://<IP>:3000/api/error` | GET | Simulates error (test alerting) |
+| `http://<IP>:3000/api/slow` | GET | Simulates slow response (1-3s) |
+| `http://<IP>:3000/metrics` | GET | Raw Prometheus metrics |
 
-#### 1. Node.js Application Dashboard
-- HTTP Requests per Second
-- Request Duration (p95 latency)
-- Active Connections (gauge)
-- Application Logs (from Loki)
-- Error Logs
+### Examples
 
-#### 2. EC2 Infrastructure Dashboard
-- CPU Usage per instance
-- Memory Usage per instance
-- Disk Usage
-- Network Traffic (receive/transmit)
-- System Logs
-
-### Adding Custom Dashboards
-1. Click **+** → **New Dashboard**
-2. Click **Add visualization**
-3. Select data source: **Prometheus** (metrics) or **Loki** (logs)
-4. Write your query and save
-
----
-
-## Using the Node.js Application
-
-The app runs on port **3000** on all instances. Use these endpoints to generate logs and test monitoring:
-
-### Health Check
 ```bash
-curl http://<APP_IP>:3000/health
-```
-Response:
-```json
-{
-  "status": "healthy",
-  "uptime": 1234.56,
-  "instanceId": "instance-1",
-  "timestamp": "2026-07-14T10:00:00.000Z",
-  "version": "1.0.0"
-}
-```
+# Health check
+curl http://<IP>:3000/health
 
-### App Info
-```bash
-curl http://<APP_IP>:3000/
-```
-
-### Get Users (generates info logs)
-```bash
-curl http://<APP_IP>:3000/api/users
-```
-
-### Create Order (generates logs with order ID)
-```bash
-curl -X POST http://<APP_IP>:3000/api/orders \
+# Create an order
+curl -X POST http://<IP>:3000/api/orders \
   -H "Content-Type: application/json" \
   -d '{"items":["laptop","mouse"],"total":1299.99}'
-```
 
-### Simulate Error (test error alerting in Grafana)
-```bash
-curl http://<APP_IP>:3000/api/error
-```
+# Trigger error (for testing Grafana alerts)
+curl http://<IP>:3000/api/error
 
-### Simulate Slow Response (test latency monitoring)
-```bash
-curl http://<APP_IP>:3000/api/slow
-```
-
-### Prometheus Metrics
-```bash
-curl http://<APP_IP>:3000/metrics
-```
-
-### Generate Traffic (load test)
-```bash
-# Run 100 requests to generate dashboard data
-for i in $(seq 1 100); do
-  curl -s http://<APP_IP>:3000/api/users > /dev/null
-  curl -s http://<APP_IP>:3000/health > /dev/null
-  curl -s -X POST http://<APP_IP>:3000/api/orders \
-    -H "Content-Type: application/json" \
-    -d "{\"items\":[\"item-$i\"],\"total\":$i}" > /dev/null
-done
-echo "Done! Check Grafana dashboards now."
+# Test slow response
+curl http://<IP>:3000/api/slow
 ```
 
 ---
 
-## Viewing Logs in Grafana (Loki)
+## Viewing Logs (Loki via Grafana)
 
-### Basic Log Viewing
-1. In Grafana → Click **Explore** (compass icon in left sidebar)
-2. Select **Loki** as the data source (top dropdown)
-3. Enter a query and click **Run query**
+Loki collects all application and system logs. View them through Grafana:
 
-### Useful Loki Queries
+1. Open Grafana → Click **Explore** (compass icon)
+2. Select **Loki** data source
+3. Use these queries:
 
-| Query | Description |
-|-------|-------------|
-| `{app="nodejs-app"}` | All application logs |
-| `{app="nodejs-app"} \|= "error"` | Only error logs |
+| Query | Shows |
+|-------|-------|
+| `{app="nodejs-app"}` | All app logs |
+| `{app="nodejs-app"} \|= "error"` | Error logs only |
 | `{app="nodejs-app"} \|= "Order created"` | Order creation logs |
 | `{app="nodejs-app"} \| json \| statusCode="500"` | HTTP 500 errors |
-| `{app="nodejs-app"} \| json \| duration > "1000ms"` | Slow requests (>1s) |
-| `{instance="instance-1"}` | Logs from specific instance |
 | `{job="syslog"}` | System logs |
-| `{job="docker"}` | Docker container logs |
-
-### Log Stream Labels
-- `app` — Application name (nodejs-app)
-- `environment` — Environment (dev/production)
-- `instance` — Instance ID (instance-1, instance-2, instance-3)
-- `job` — Log source (docker, syslog, auth)
-
----
-
-## Prometheus Metrics
-
-### Access Prometheus UI
-Open: `http://<MONITORING_IP>:9090`
-
-### Useful PromQL Queries
-
-| Query | Description |
-|-------|-------------|
-| `rate(http_requests_total[5m])` | Request rate per second |
-| `histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))` | p95 latency |
-| `active_connections` | Current active connections |
-| `100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)` | CPU usage % |
-| `(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100` | Memory usage % |
-| `node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}` | Disk free % |
-
-### Targets
-Check scrape targets at: `http://<MONITORING_IP>:9090/targets`
-- prometheus (self)
-- nodejs-app:3000
-- node-exporter:9100
-
----
-
-## EC2 On/Off Control
-
-### Via GitHub Actions (Recommended)
-1. Go to: **Actions** → **EC2 Toggle** (or **Infrastructure On/Off Control** after merging PR #1)
-2. Click **"Run workflow"**
-3. Select:
-   - **Action**: `start`, `stop`, or `status`
-   - **Target**: `all`, `monitoring-only`, `app-only`, `instance-1/2/3`
-4. Click **"Run workflow"**
-
-### Via AWS CLI
-```bash
-# Get instance IDs
-aws ec2 describe-instances \
-  --filters "Name=tag:Project,Values=grafana-loki-monitoring" \
-  --query 'Reservations[].Instances[].InstanceId' \
-  --output text --region us-east-1
-
-# Stop all instances (save cost at night)
-aws ec2 stop-instances --instance-ids i-xxx i-yyy i-zzz --region us-east-1
-
-# Start all instances
-aws ec2 start-instances --instance-ids i-xxx i-yyy i-zzz --region us-east-1
-
-# Check status
-aws ec2 describe-instances \
-  --filters "Name=tag:Project,Values=grafana-loki-monitoring" \
-  --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],State.Name,PublicIpAddress]' \
-  --output table --region us-east-1
-```
-
-### Automatic Schedule (after merging PR #1)
-| Day | Auto-Start | Auto-Stop |
-|-----|-----------|-----------|
-| Monday-Friday | 7:00 AM UTC | 8:00 PM UTC |
-| Saturday-Sunday | Off | Off |
-
----
-
-## SSH Access
-
-```bash
-# SSH to monitoring server (Instance 1)
-ssh -i your-key.pem ubuntu@<MONITORING_IP>
-
-# SSH to app server (Instance 2 or 3)
-ssh -i your-key.pem ubuntu@<APP_IP>
-
-# Check services on the instance
-docker ps                          # Running containers
-docker-compose logs -f             # Live logs
-systemctl status node_exporter     # Node exporter status
-curl localhost:3000/health         # App health check
-curl localhost:3001/api/health     # Grafana health check
-```
+| `{job="docker"}` | All Docker container logs |
 
 ---
 
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │           AWS Cloud (us-east-1)          │
-                    └─────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────────────────┐
-│  VPC: 10.0.0.0/16                                                      │
-│                                                                         │
-│  ┌─── EC2 Instance 1 (Monitoring Server) ─────────────────────────┐   │
-│  │  Role: monitoring                                                │   │
-│  │                                                                   │   │
-│  │  ┌─────────┐  ┌──────┐  ┌────────────┐  ┌──────────┐          │   │
-│  │  │ Grafana │  │ Loki │  │ Prometheus │  │ Promtail │          │   │
-│  │  │  :3001  │  │:3100 │  │   :9090    │  │  :9080   │          │   │
-│  │  └─────────┘  └──────┘  └────────────┘  └──────────┘          │   │
-│  │  ┌──────────────┐  ┌──────────────┐                            │   │
-│  │  │  Node.js App │  │ Node Exporter│                            │   │
-│  │  │    :3000     │  │    :9100     │                            │   │
-│  │  └──────────────┘  └──────────────┘                            │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-│  ┌─── EC2 Instance 2 (App Server) ────────────────────────────────┐   │
-│  │  Role: application                                               │   │
-│  │  ┌──────────────┐  ┌──────────────┐                            │   │
-│  │  │  Node.js App │  │ Node Exporter│  → metrics → Prometheus    │   │
-│  │  │    :3000     │  │    :9100     │  → logs → Loki             │   │
-│  │  └──────────────┘  └──────────────┘                            │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-│  ┌─── EC2 Instance 3 (App Server) ────────────────────────────────┐   │
-│  │  Role: application                                               │   │
-│  │  ┌──────────────┐  ┌──────────────┐                            │   │
-│  │  │  Node.js App │  │ Node Exporter│  → metrics → Prometheus    │   │
-│  │  │    :3000     │  │    :9100     │  → logs → Loki             │   │
-│  │  └──────────────┘  └──────────────┘                            │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-└────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Single EC2 Instance (t3.medium)                             │
+│                                                               │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │  Docker Containers:                                      │ │
+│  │                                                           │ │
+│  │  ┌─────────┐ ┌──────┐ ┌────────────┐ ┌──────────┐     │ │
+│  │  │ Grafana │ │ Loki │ │ Prometheus │ │ Promtail │     │ │
+│  │  │  :3001  │ │:3100 │ │   :9090    │ │          │     │ │
+│  │  └─────────┘ └──────┘ └────────────┘ └──────────┘     │ │
+│  │                                                           │ │
+│  │  ┌──────────────┐  ┌──────────────┐                    │ │
+│  │  │  Node.js App │  │ Node Exporter│                    │ │
+│  │  │    :3000     │  │    :9100     │                    │ │
+│  │  └──────────────┘  └──────────────┘                    │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│                                                               │
+│  Auto-starts on boot via systemd + docker-compose             │
+└─────────────────────────────────────────────────────────────┘
 
 Data Flow:
-  App → Winston Logger → Loki → Grafana (Logs)
-  App → /metrics endpoint → Prometheus → Grafana (Metrics)
-  EC2 → Node Exporter → Prometheus → Grafana (Infra Metrics)
+  Node.js App → logs → Loki → Grafana (log dashboards)
+  Node.js App → /metrics → Prometheus → Grafana (metric dashboards)
+  EC2 System → Node Exporter → Prometheus → Grafana (infra dashboards)
 ```
 
 ---
 
-## Cost Estimation
+## Security
 
-### All 3 Instances Running 24/7
+| Port | Service | Who can access |
+|------|---------|---------------|
+| 22 | SSH | Your IP (or SSM — no SSH needed) |
+| 3000 | Node.js App | Public |
+| 3001 | Grafana | Public (password protected) |
+| 9090 | Prometheus | Public |
+| 3100 | Loki | Public (API only) |
+| 9100 | Node Exporter | Public |
 
-| Resource | Monthly Cost |
-|----------|-------------|
-| 3x t3.medium EC2 | ~$90 |
-| 3x 30GB gp3 EBS | ~$7.50 |
-| 3x Elastic IPs (attached) | Free |
-| S3 (state) | ~$0.05 |
-| DynamoDB (locks) | ~$0.01 |
-| **Total** | **~$98/month** |
-
-### With Auto Stop/Start (12 hrs/day, weekdays only)
-
-| Resource | Monthly Cost |
-|----------|-------------|
-| 3x t3.medium (12hrs x 22days) | ~$37 |
-| 3x 30GB gp3 EBS | ~$7.50 |
-| 3x Elastic IPs (detached when stopped) | ~$11 |
-| **Total** | **~$56/month** |
-
-### Cost Saving Tips
-- Use EC2 Toggle to **stop instances at night**
-- Enable the scheduled auto-stop (merge PR #1)
-- Consider `t3.small` for non-production ($0.0208/hr vs $0.0416/hr)
-- Reduce to 2 instances if 3 aren't needed
+**Recommendation:** Restrict security group to your IP for production use.
 
 ---
 
-## Troubleshooting
+## Docker Commands (inside EC2)
 
-### Can't access Grafana/App in browser
-- Check Security Group allows your IP on ports 3000, 3001
-- Check instance is **running** (not stopped)
-- Check public IP hasn't changed (use Elastic IP)
-- Try: `curl http://<IP>:3000/health` from your machine
+Connect via SSM or SSH, then:
 
-### Terraform apply failed
-- Check AWS secrets are set in GitHub (Settings → Secrets)
-- Check S3 bucket exists: `aws s3 ls | grep ai-monitoring`
-- Check key pair exists: `aws ec2 describe-key-pairs --region us-east-1`
-
-### Docker containers not starting
 ```bash
-ssh ubuntu@<IP>
-cd /opt/monitoring-app
-docker-compose ps          # Check status
-docker-compose logs        # Check errors
-docker-compose up -d       # Restart all
+# Check running containers
+docker ps
+
+# View all logs
+cd /opt/monitoring-app && docker-compose logs --tail 50
+
+# Restart all services
+docker-compose restart
+
+# Stop all services
+docker-compose down
+
+# Start all services
+docker-compose up -d
+
+# Rebuild Node.js app after code changes
+docker-compose build nodejs-app && docker-compose up -d nodejs-app
+
+# Check resource usage
+docker stats --no-stream
 ```
-
-### No data in Grafana dashboards
-- Wait 2-3 minutes after starting (Prometheus needs to scrape)
-- Generate some traffic: `curl http://<IP>:3000/api/users`
-- Check Prometheus targets: `http://<IP>:9090/targets`
-- Check Loki: `http://<IP>:3100/ready`
-
-### Pipeline fails
-- Check GitHub Actions tab for error details
-- Ensure all secrets are added (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_KEY_PAIR_NAME)
-- Run with `plan` first before `apply`
 
 ---
 
-## Quick Reference Card
+## Monthly Cost
 
-```
-Grafana:     http://<MONITORING_IP>:3001  (admin/admin123)
-Prometheus:  http://<MONITORING_IP>:9090
-App:         http://<ANY_IP>:3000
-Health:      http://<ANY_IP>:3000/health
-Metrics:     http://<ANY_IP>:3000/metrics
-SSH:         ssh -i key.pem ubuntu@<IP>
-
-Start EC2:   GitHub Actions → EC2 Toggle → start → all
-Stop EC2:    GitHub Actions → EC2 Toggle → stop → all
-Deploy:      GitHub Actions → Deploy Infrastructure → apply
-Destroy:     GitHub Actions → Deploy Infrastructure → destroy
-```
+| Usage Pattern | Cost |
+|--------------|------|
+| Running 24/7 | ~$37/month |
+| 12 hrs/day weekdays (auto schedule) | ~$23/month |
+| Stopped (storage only) | ~$7/month |
+| Destroyed | $0/month |
