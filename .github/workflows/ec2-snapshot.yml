@@ -1,0 +1,347 @@
+name: "EC2 Snapshot & Restore"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Select Action"
+        required: true
+        type: choice
+        options:
+          - "Create Snapshot"
+          - "List Snapshots"
+          - "Restore from Latest Snapshot"
+          - "Delete Old Snapshots (keep last 3)"
+      confirm:
+        description: "Type 'yes' to confirm (required for Restore/Delete)"
+        required: false
+        type: string
+        default: ""
+  schedule:
+    # Auto-snapshot every day at 2 AM UTC (backup)
+    - cron: '0 2 * * *'
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_TAG: grafana-loki-monitoring
+
+jobs:
+  # ─────────────────────────────────────────
+  # Snapshot Management
+  # ─────────────────────────────────────────
+  snapshot:
+    name: "${{ github.event.inputs.action || 'Auto Snapshot' }}"
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    steps:
+      - name: Determine action
+        id: config
+        run: |
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            echo "action=Create Snapshot" >> $GITHUB_OUTPUT
+            echo "auto=true" >> $GITHUB_OUTPUT
+          else
+            echo "action=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
+            echo "auto=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get EC2 instance details
+        id: instance
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+              "Name=instance-state-name,Values=running,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+          
+          VOLUME_ID=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[].Instances[].BlockDeviceMappings[0].Ebs.VolumeId' \
+            --output text)
+          
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "volume_id=$VOLUME_ID" >> $GITHUB_OUTPUT
+          echo "Instance: $INSTANCE_ID | Volume: $VOLUME_ID"
+
+      # ─────────────────────────────────────
+      # CREATE SNAPSHOT
+      # ─────────────────────────────────────
+      - name: "Create Snapshot"
+        if: steps.config.outputs.action == 'Create Snapshot'
+        id: create
+        run: |
+          TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
+          DESCRIPTION="ai-monitoring-backup-$TIMESTAMP"
+          
+          echo "Creating snapshot of volume ${{ steps.instance.outputs.volume_id }}..."
+          
+          SNAPSHOT_ID=$(aws ec2 create-snapshot \
+            --region ${{ env.AWS_REGION }} \
+            --volume-id "${{ steps.instance.outputs.volume_id }}" \
+            --description "$DESCRIPTION" \
+            --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=$DESCRIPTION},{Key=Project,Value=${{ env.PROJECT_TAG }}},{Key=CreatedBy,Value=github-actions},{Key=Timestamp,Value=$TIMESTAMP}]" \
+            --query 'SnapshotId' \
+            --output text)
+          
+          echo "snapshot_id=$SNAPSHOT_ID" >> $GITHUB_OUTPUT
+          echo ""
+          echo "==========================================="
+          echo "  SNAPSHOT CREATED!"
+          echo "==========================================="
+          echo "  Snapshot ID:  $SNAPSHOT_ID"
+          echo "  Description:  $DESCRIPTION"
+          echo "  Volume:       ${{ steps.instance.outputs.volume_id }}"
+          echo "  Instance:     ${{ steps.instance.outputs.instance_id }}"
+          echo "  Time:         $(date -u)"
+          echo "==========================================="
+          echo ""
+          echo "Waiting for snapshot to complete..."
+          
+          aws ec2 wait snapshot-completed \
+            --region ${{ env.AWS_REGION }} \
+            --snapshot-ids $SNAPSHOT_ID
+          
+          echo "Snapshot completed!"
+
+      # ─────────────────────────────────────
+      # LIST SNAPSHOTS
+      # ─────────────────────────────────────
+      - name: "List Snapshots"
+        if: steps.config.outputs.action == 'List Snapshots'
+        run: |
+          echo "==========================================="
+          echo "  AVAILABLE SNAPSHOTS"
+          echo "==========================================="
+          echo ""
+          
+          aws ec2 describe-snapshots \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'Snapshots | sort_by(@, &StartTime) | reverse(@) | [].[SnapshotId,StartTime,State,Description,VolumeSize]' \
+            --output table
+          
+          LATEST=$(aws ec2 describe-snapshots \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'Snapshots | sort_by(@, &StartTime) | reverse(@) | [0].SnapshotId' \
+            --output text)
+          
+          echo ""
+          echo "Latest snapshot: $LATEST"
+          echo ""
+          echo "Total snapshots: $(aws ec2 describe-snapshots \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'length(Snapshots)' --output text)"
+
+      # ─────────────────────────────────────
+      # RESTORE FROM SNAPSHOT
+      # ─────────────────────────────────────
+      - name: "Safety check for Restore"
+        if: steps.config.outputs.action == 'Restore from Latest Snapshot'
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "yes" ]; then
+            echo "::error::You must type 'yes' in the confirm field to restore from snapshot!"
+            echo ""
+            echo "This action will:"
+            echo "  1. Stop the current instance"
+            echo "  2. Detach the current volume"
+            echo "  3. Create a new volume from the latest snapshot"
+            echo "  4. Attach it to the instance"
+            echo "  5. Start the instance"
+            echo ""
+            echo "Type 'yes' in the confirm field to proceed."
+            exit 1
+          fi
+
+      - name: "Restore from Latest Snapshot"
+        if: steps.config.outputs.action == 'Restore from Latest Snapshot' && github.event.inputs.confirm == 'yes'
+        run: |
+          INSTANCE_ID="${{ steps.instance.outputs.instance_id }}"
+          
+          # Get latest snapshot
+          SNAPSHOT_ID=$(aws ec2 describe-snapshots \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'Snapshots | sort_by(@, &StartTime) | reverse(@) | [0].SnapshotId' \
+            --output text)
+          
+          if [ -z "$SNAPSHOT_ID" ] || [ "$SNAPSHOT_ID" == "None" ]; then
+            echo "::error::No snapshots found! Create a snapshot first."
+            exit 1
+          fi
+          
+          SNAPSHOT_DATE=$(aws ec2 describe-snapshots \
+            --region ${{ env.AWS_REGION }} \
+            --snapshot-ids $SNAPSHOT_ID \
+            --query 'Snapshots[0].StartTime' --output text)
+          
+          echo "==========================================="
+          echo "  RESTORING FROM SNAPSHOT"
+          echo "==========================================="
+          echo "  Snapshot:  $SNAPSHOT_ID"
+          echo "  Date:      $SNAPSHOT_DATE"
+          echo "  Instance:  $INSTANCE_ID"
+          echo "==========================================="
+          echo ""
+          
+          # Get current volume and AZ
+          CURRENT_VOLUME=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[].Instances[].BlockDeviceMappings[0].Ebs.VolumeId' \
+            --output text)
+          
+          AZ=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[].Instances[].Placement.AvailabilityZone' \
+            --output text)
+          
+          DEVICE=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[].Instances[].BlockDeviceMappings[0].DeviceName' \
+            --output text)
+          
+          echo "Step 1/5: Stopping instance..."
+          aws ec2 stop-instances --region ${{ env.AWS_REGION }} --instance-ids $INSTANCE_ID
+          aws ec2 wait instance-stopped --region ${{ env.AWS_REGION }} --instance-ids $INSTANCE_ID
+          echo "  Instance stopped."
+          
+          echo "Step 2/5: Detaching current volume ($CURRENT_VOLUME)..."
+          aws ec2 detach-volume --region ${{ env.AWS_REGION }} --volume-id $CURRENT_VOLUME
+          sleep 10
+          echo "  Volume detached."
+          
+          echo "Step 3/5: Creating new volume from snapshot..."
+          NEW_VOLUME=$(aws ec2 create-volume \
+            --region ${{ env.AWS_REGION }} \
+            --snapshot-id $SNAPSHOT_ID \
+            --availability-zone $AZ \
+            --volume-type gp3 \
+            --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=${{ env.PROJECT_TAG }}-restored},{Key=Project,Value=${{ env.PROJECT_TAG }}}]" \
+            --query 'VolumeId' --output text)
+          
+          echo "  New volume: $NEW_VOLUME"
+          aws ec2 wait volume-available --region ${{ env.AWS_REGION }} --volume-ids $NEW_VOLUME
+          echo "  Volume ready."
+          
+          echo "Step 4/5: Attaching new volume..."
+          aws ec2 attach-volume \
+            --region ${{ env.AWS_REGION }} \
+            --volume-id $NEW_VOLUME \
+            --instance-id $INSTANCE_ID \
+            --device $DEVICE
+          sleep 10
+          echo "  Volume attached."
+          
+          echo "Step 5/5: Starting instance..."
+          aws ec2 start-instances --region ${{ env.AWS_REGION }} --instance-ids $INSTANCE_ID
+          aws ec2 wait instance-running --region ${{ env.AWS_REGION }} --instance-ids $INSTANCE_ID
+          echo "  Instance started!"
+          
+          # Get new IP
+          NEW_IP=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+          
+          echo ""
+          echo "==========================================="
+          echo "  RESTORE COMPLETE!"
+          echo "==========================================="
+          echo "  Instance:   $INSTANCE_ID"
+          echo "  New Volume: $NEW_VOLUME"
+          echo "  From:       $SNAPSHOT_ID ($SNAPSHOT_DATE)"
+          echo "  Public IP:  $NEW_IP"
+          echo ""
+          echo "  Grafana:    http://$NEW_IP:3001"
+          echo "  App:        http://$NEW_IP:3000"
+          echo "==========================================="
+          echo ""
+          echo "Note: Old volume $CURRENT_VOLUME is now detached."
+          echo "Delete it manually if no longer needed:"
+          echo "  aws ec2 delete-volume --volume-id $CURRENT_VOLUME --region ${{ env.AWS_REGION }}"
+
+      # ─────────────────────────────────────
+      # DELETE OLD SNAPSHOTS
+      # ─────────────────────────────────────
+      - name: "Safety check for Delete"
+        if: steps.config.outputs.action == 'Delete Old Snapshots (keep last 3)'
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "yes" ]; then
+            echo "::error::You must type 'yes' to delete old snapshots!"
+            exit 1
+          fi
+
+      - name: "Delete Old Snapshots (keep last 3)"
+        if: steps.config.outputs.action == 'Delete Old Snapshots (keep last 3)' && github.event.inputs.confirm == 'yes'
+        run: |
+          echo "Fetching all snapshots..."
+          
+          ALL_SNAPSHOTS=$(aws ec2 describe-snapshots \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'Snapshots | sort_by(@, &StartTime) | reverse(@) | [].SnapshotId' \
+            --output text)
+          
+          TOTAL=$(echo $ALL_SNAPSHOTS | wc -w)
+          echo "Total snapshots: $TOTAL"
+          
+          if [ "$TOTAL" -le 3 ]; then
+            echo "Only $TOTAL snapshots exist. Nothing to delete (keeping minimum 3)."
+            exit 0
+          fi
+          
+          # Keep first 3, delete the rest
+          DELETE_SNAPSHOTS=$(echo $ALL_SNAPSHOTS | tr ' ' '\n' | tail -n +4)
+          DELETE_COUNT=$(echo "$DELETE_SNAPSHOTS" | wc -l)
+          
+          echo "Keeping latest 3 snapshots. Deleting $DELETE_COUNT old snapshots..."
+          echo ""
+          
+          for SNAP_ID in $DELETE_SNAPSHOTS; do
+            echo "  Deleting: $SNAP_ID"
+            aws ec2 delete-snapshot --region ${{ env.AWS_REGION }} --snapshot-id $SNAP_ID
+          done
+          
+          echo ""
+          echo "Deleted $DELETE_COUNT old snapshots. 3 latest snapshots retained."
+
+      # ─────────────────────────────────────
+      # SUMMARY
+      # ─────────────────────────────────────
+      - name: Summary
+        if: always()
+        run: |
+          ACTION="${{ steps.config.outputs.action }}"
+          
+          echo "## EC2 Snapshot: $ACTION" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | $ACTION |" >> $GITHUB_STEP_SUMMARY
+          echo "| Instance | ${{ steps.instance.outputs.instance_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Volume | ${{ steps.instance.outputs.volume_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$ACTION" == "Create Snapshot" ]; then
+            echo "| Snapshot ID | ${{ steps.create.outputs.snapshot_id }} |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Available Snapshots:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          aws ec2 describe-snapshots \
+            --region ${{ env.AWS_REGION }} \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+            --query 'Snapshots | sort_by(@, &StartTime) | reverse(@) | [].[SnapshotId,StartTime,State]' \
+            --output table >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No snapshots" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
