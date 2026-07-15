@@ -1,174 +1,259 @@
 # Grafana + Loki + Node.js EC2 Monitoring Stack
 
-A production-ready monitoring infrastructure deploying Grafana, Loki, Prometheus, and a Node.js application across 3 AWS EC2 instances with full observability, logging, and metrics collection.
+A complete **AI-powered monitoring solution** running on a single AWS EC2 instance with automated deployment, Docker auto-start, snapshot backups, and one-click infrastructure control via GitHub Actions.
+
+## Features
+
+- **Grafana** — Dashboards for metrics and log visualization
+- **Loki** — Log aggregation (view app logs in Grafana)
+- **Prometheus** — Metrics collection and alerting
+- **Node.js App** — Sample application with built-in logging and metrics
+- **Docker Auto-Start** — All services start automatically on EC2 boot/reboot
+- **CI/CD Pipeline** — Terraform infrastructure + Docker build via GitHub Actions
+- **EC2 Start/Stop** — One-click on/off with cost-saving auto-schedule
+- **Snapshot & Restore** — Backup and restore infrastructure with zero data loss
+- **SSM Access** — Connect to EC2 without SSH keys
+- **Approval Gates** — Safety confirmation for destructive actions
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              AWS VPC (10.0.0.0/16)                           │
-│                                                                             │
-│  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐ │
-│  │   EC2 Instance 1    │  │   EC2 Instance 2    │  │   EC2 Instance 3    │ │
-│  │   (Monitoring)      │  │   (Application)     │  │   (Application)     │ │
-│  │                     │  │                     │  │                     │ │
-│  │  ┌───────────────┐  │  │  ┌───────────────┐  │  │  ┌───────────────┐  │ │
-│  │  │ Grafana :3001 │  │  │  │ Node.js :3000 │  │  │  │ Node.js :3000 │  │ │
-│  │  │ Loki    :3100 │  │  │  │ Promtail      │  │  │  │ Promtail      │  │ │
-│  │  │ Prometheus    │  │  │  │ Node Exporter │  │  │  │ Node Exporter │  │ │
-│  │  │   :9090       │  │  │  │   :9100       │  │  │  │   :9100       │  │ │
-│  │  │ Promtail      │  │  │  └───────────────┘  │  │  └───────────────┘  │ │
-│  │  │ Node Exporter │  │  │                     │  │                     │ │
-│  │  │   :9100       │  │  │                     │  │                     │ │
-│  │  └───────────────┘  │  └─────────────────────┘  └─────────────────────┘ │
-│  └─────────────────────┘                                                    │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │                     Internet Gateway                                    ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  AWS EC2 (Single Instance - t3.medium)                           │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  Docker Containers (auto-start on boot):                     │ │
+│  │                                                               │ │
+│  │  ┌─────────┐ ┌──────┐ ┌────────────┐ ┌──────────┐         │ │
+│  │  │ Grafana │ │ Loki │ │ Prometheus │ │ Promtail │         │ │
+│  │  │  :3001  │ │:3100 │ │   :9090    │ │          │         │ │
+│  │  └─────────┘ └──────┘ └────────────┘ └──────────┘         │ │
+│  │                                                               │ │
+│  │  ┌──────────────┐  ┌──────────────┐                        │ │
+│  │  │  Node.js App │  │ Node Exporter│                        │ │
+│  │  │    :3000     │  │    :9100     │                        │ │
+│  │  └──────────────┘  └──────────────┘                        │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  systemd monitoring-stack.service → docker-compose up -d          │
+└─────────────────────────────────────────────────────────────────┘
+
+Data Flow:
+  App → Winston Logger → Loki → Grafana (Logs)
+  App → /metrics → Prometheus → Grafana (Metrics)
+  EC2 → Node Exporter → Prometheus → Grafana (Infrastructure)
 ```
 
-## Components
+---
 
-| Component      | Port | Description                              |
-|----------------|------|------------------------------------------|
-| Grafana        | 3001 | Visualization and dashboards             |
-| Loki           | 3100 | Log aggregation system                   |
-| Prometheus     | 9090 | Metrics collection and storage           |
-| Node.js App    | 3000 | Application with logging and metrics     |
-| Node Exporter  | 9100 | System-level metrics (CPU, memory, disk) |
+## Services & Ports
+
+| Service | Port | URL | Description |
+|---------|------|-----|-------------|
+| Grafana | 3001 | `http://<IP>:3001` | Dashboards & log viewer |
+| Node.js App | 3000 | `http://<IP>:3000` | Sample application |
+| Prometheus | 9090 | `http://<IP>:9090` | Metrics query UI |
+| Loki | 3100 | `http://<IP>:3100` | Log API (view via Grafana) |
+| Node Exporter | 9100 | `http://<IP>:9100` | System metrics |
+
+**Grafana Login:** admin / admin123
+
+---
+
+## Project Structure
+
+```
+Ai-Monitoring/
+├── .github/workflows/
+│   ├── deploy.yml              # Infrastructure deploy/destroy pipeline
+│   ├── ec2-toggle.yml          # EC2 Start/Stop with auto-schedule
+│   ├── ec2-snapshot.yml        # Snapshot backup & restore
+│   └── ec2-start-stop.yml      # Simple one-click start/stop
+├── nodejs-app/
+│   ├── src/
+│   │   ├── index.js            # Express server (7 endpoints)
+│   │   ├── logger.js           # Winston + Loki transport
+│   │   └── metrics.js          # Prometheus metrics (prom-client)
+│   ├── Dockerfile              # Node 22 Alpine container
+│   └── package.json
+├── monitoring/
+│   ├── docker-compose.yml      # All 6 services
+│   ├── loki/loki-config.yml    # Loki storage config
+│   ├── prometheus/prometheus.yml # Scrape targets
+│   ├── promtail/promtail-config.yml # Log collection
+│   ├── dashboards/             # Pre-built Grafana dashboards
+│   └── provisioning/           # Auto-configured datasources
+├── terraform/
+│   ├── main.tf                 # Provider + S3 backend
+│   ├── ec2.tf                  # Single EC2 + IAM + EIP
+│   ├── vpc.tf                  # VPC + subnet + IGW
+│   ├── security-groups.tf      # Ports 22,3000,3001,9090,3100,9100
+│   ├── outputs.tf              # IP, URLs, SSM command
+│   ├── variables.tf            # Configurable variables
+│   └── templates/user-data.sh  # Auto-setup script (Docker + app)
+├── scripts/
+│   ├── ec2-control.sh          # CLI start/stop/status
+│   ├── health-check.sh         # Service health checker
+│   └── setup-monitoring.sh     # Manual setup helper
+├── docs/
+│   ├── WORKFLOW-GUIDE.md       # Step-by-step workflow guide
+│   └── USAGE-GUIDE.md         # How to use the application
+└── README.md
+```
+
+---
+
+## GitHub Actions Workflows
+
+| Workflow | Actions | Approval | Schedule |
+|---------|---------|----------|----------|
+| **Deploy Infrastructure** | plan, apply, apply-from-snapshot, destroy | Yes (destroy/restore) | On push to main |
+| **EC2 Start / Stop** | START, STOP, STATUS | No | Auto: 7AM start, 8PM stop (Mon-Fri) |
+| **EC2 Snapshot & Restore** | Create, List, Restore, Delete old | Yes (restore/delete) | Auto: daily 2AM backup |
+| **EC2 Start/Stop (Simple)** | START All, STOP All, STATUS | No | — |
+
+---
 
 ## Quick Start
 
 ### Prerequisites
 
-- Docker and Docker Compose
-- Node.js >= 18.0.0
-- AWS CLI v2 (for EC2 deployment)
-- Terraform >= 1.5.0 (for infrastructure provisioning)
+- AWS account with CLI configured
+- GitHub account with this repo
+- GitHub Secrets configured:
 
-### Local Development
+| Secret | Value |
+|--------|-------|
+| `AWS_ACCESS_KEY_ID` | Your AWS access key |
+| `AWS_SECRET_ACCESS_KEY` | Your AWS secret key |
+| `AWS_KEY_PAIR_NAME` | EC2 key pair name |
 
+### Deploy (one-time)
+
+1. Go to **Actions** → **Deploy Infrastructure** → **Run workflow**
+2. Select: `apply`
+3. Click **Run workflow**
+4. Wait 8-10 minutes (Terraform + EC2 boot + Docker setup)
+5. Open: `http://<IP>:3001` → Grafana is live!
+
+### Daily Usage
+
+| Action | Steps |
+|--------|-------|
+| **Start** | Actions → EC2 Start / Stop → `START` |
+| **Stop** | Actions → EC2 Start / Stop → `STOP` |
+| **Check** | Actions → EC2 Start / Stop → `STATUS` |
+
+### Backup & Restore
+
+| Action | Steps |
+|--------|-------|
+| **Backup** | Actions → EC2 Snapshot & Restore → `Create Snapshot` |
+| **Destroy safely** | Actions → Deploy Infrastructure → `destroy` + type 'yes' (auto-snapshots first!) |
+| **Restore** | Actions → Deploy Infrastructure → `apply-from-snapshot` + type 'yes' |
+
+---
+
+## Node.js API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | App info + available endpoints |
+| `/health` | GET | Health status, uptime, instance ID |
+| `/api/users` | GET | Sample user list (generates logs) |
+| `/api/orders` | POST | Create order (generates logs) |
+| `/api/error` | GET | Simulate error (test alerting) |
+| `/api/slow` | GET | Simulate slow response (1-3s) |
+| `/metrics` | GET | Prometheus metrics |
+
+---
+
+## Grafana Dashboards
+
+Two pre-built dashboards included:
+
+### Node.js Application Dashboard
+- HTTP Requests per Second
+- Request Duration (p95 latency)
+- Active Connections
+- Application Logs (from Loki)
+- Error Logs
+
+### EC2 Infrastructure Dashboard
+- CPU Usage
+- Memory Usage
+- Disk Usage
+- Network Traffic (receive/transmit)
+- System Logs
+
+---
+
+## What Happens on EC2 Boot
+
+The user-data script runs automatically when EC2 starts:
+
+```
+[1/8] Install system packages
+[2/8] Install Docker & Docker Compose
+[3/8] Install SSM Agent (no SSH key needed)
+[4/8] Clone this repo from GitHub
+[5/8] Build Node.js Docker image
+[6/8] docker-compose up -d (ALL services start)
+[7/8] Create systemd service (auto-restart on reboot)
+[8/8] Health check all services
+```
+
+**Result:** All services running within 5 minutes of instance creation. No manual SSH or setup needed.
+
+---
+
+## Connect to EC2 (No SSH Key Required)
+
+### Via GitHub Actions
+```
+Actions → EC2 Connect & Debug → Select instance → Type command → Run
+```
+
+### Via AWS CLI
 ```bash
-# Start the monitoring stack locally
-cd monitoring
-./scripts/setup-monitoring.sh
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=grafana-loki-monitoring" \
+  --query 'Reservations[].Instances[].InstanceId' --output text --region us-east-1)
 
-# Or manually
-docker-compose up -d
-
-# Access services
-# Grafana:    http://localhost:3001 (admin/admin123)
-# Node.js:    http://localhost:3000
-# Prometheus: http://localhost:9090
-# Loki:       http://localhost:3100
+aws ssm start-session --target $INSTANCE_ID --region us-east-1
 ```
 
-### EC2 Deployment
+---
 
-```bash
-# Initialize Terraform
-cd terraform
-terraform init
+## Cost
 
-# Plan and apply
-terraform plan -out=tfplan
-terraform apply tfplan
-```
+| Pattern | Monthly Cost |
+|---------|-------------|
+| Running 24/7 | ~$37 |
+| 12 hrs/day weekdays (auto schedule) | ~$23 |
+| Stopped (storage only) | ~$7 |
+| Destroyed | $0 |
 
-## EC2 On/Off Toggle
+---
 
-### GitHub Actions (Recommended)
+## Terraform Backend
 
-Use the **EC2 Toggle** workflow (`ec2-toggle.yml`) from the Actions tab:
+| Resource | Name |
+|----------|------|
+| S3 Bucket | `ai-monitoring-tfstate-496251222247` |
+| DynamoDB Table | `ai-monitoring-tf-locks` |
+| Region | `us-east-1` |
 
-1. Go to **Actions** → **EC2 Toggle**
-2. Click **Run workflow**
-3. Select action: `start`, `stop`, or `status`
-4. Select instances: `all`, `monitoring-only`, `app-only`, `instance-1`, `instance-2`, `instance-3`
+---
 
-**Scheduled:**
-- Auto-stop: Weekdays at 8:00 PM UTC
-- Auto-start: Weekdays at 7:00 AM UTC
+## Documentation
 
-### CLI
+- **[docs/WORKFLOW-GUIDE.md](docs/WORKFLOW-GUIDE.md)** — Complete step-by-step workflow instructions
+- **[docs/USAGE-GUIDE.md](docs/USAGE-GUIDE.md)** — How to use Grafana, Prometheus, Loki, and the Node.js app
 
-```bash
-# Start all instances
-./scripts/ec2-control.sh start all
-
-# Stop application instances only
-./scripts/ec2-control.sh stop app
-
-# Check status of a specific instance
-./scripts/ec2-control.sh status 2
-
-# Restart monitoring instance
-./scripts/ec2-control.sh restart monitoring
-```
-
-## CI/CD Pipeline
-
-The deployment pipeline (`.github/workflows/deploy.yml`) includes:
-
-1. **Validate** - Terraform format check, validation, Node.js tests
-2. **Build** - Docker image build and artifact creation
-3. **Terraform Plan** - Infrastructure change preview
-4. **Terraform Apply** - Deploy infrastructure (requires approval)
-5. **Terraform Destroy** - Manual teardown option
-
-Triggers:
-- Push to `main` (paths: `terraform/`, `nodejs-app/`, `monitoring/`)
-- Pull requests
-- Manual dispatch (plan/apply/destroy)
-
-## Required GitHub Secrets
-
-| Secret                 | Description                          |
-|------------------------|--------------------------------------|
-| `AWS_ACCESS_KEY_ID`    | AWS IAM access key                   |
-| `AWS_SECRET_ACCESS_KEY`| AWS IAM secret key                   |
-| `AWS_KEY_PAIR_NAME`    | EC2 key pair name for SSH access     |
-
-## API Endpoints
-
-| Method | Endpoint      | Description                          |
-|--------|---------------|--------------------------------------|
-| GET    | `/`           | Application info and version         |
-| GET    | `/health`     | Health check (status, uptime, id)    |
-| GET    | `/api/users`  | Sample users list                    |
-| POST   | `/api/orders` | Create order (returns random ID)     |
-| GET    | `/api/error`  | Simulate error (for testing alerts)  |
-| GET    | `/api/slow`   | Simulate slow response (1-3s delay)  |
-| GET    | `/metrics`    | Prometheus metrics endpoint          |
-
-## Project Structure
-
-```
-.
-├── .github/workflows/      # CI/CD and EC2 toggle workflows
-├── monitoring/
-│   ├── dashboards/         # Grafana dashboard JSON files
-│   ├── loki/               # Loki configuration
-│   ├── prometheus/         # Prometheus configuration
-│   ├── promtail/           # Promtail configuration
-│   ├── provisioning/       # Grafana provisioning (datasources, dashboards)
-│   └── docker-compose.yml  # Full monitoring stack
-├── nodejs-app/
-│   ├── src/                # Application source code
-│   ├── Dockerfile          # Container image
-│   └── package.json        # Dependencies
-├── terraform/
-│   ├── templates/          # User data scripts
-│   ├── main.tf             # Provider and backend config
-│   ├── vpc.tf              # VPC and networking
-│   ├── ec2.tf              # EC2 instances
-│   ├── security-groups.tf  # Security group rules
-│   ├── variables.tf        # Input variables
-│   └── outputs.tf          # Output values
-└── scripts/                # Utility scripts
-```
+---
 
 ## License
 
