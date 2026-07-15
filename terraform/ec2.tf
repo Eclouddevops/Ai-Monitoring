@@ -46,8 +46,6 @@ resource "aws_iam_role_policy" "ec2_policy" {
         Effect = "Allow"
         Action = [
           "cloudwatch:PutMetricData",
-          "cloudwatch:GetMetricStatistics",
-          "cloudwatch:ListMetrics",
           "logs:CreateLogGroup",
           "logs:CreateLogStream",
           "logs:PutLogEvents",
@@ -76,7 +74,6 @@ resource "aws_iam_role_policy" "ec2_policy" {
   })
 }
 
-# Attach AWS managed SSM policy for Session Manager
 resource "aws_iam_role_policy_attachment" "ssm_policy" {
   role       = aws_iam_role.ec2_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -87,17 +84,11 @@ resource "aws_iam_instance_profile" "ec2_profile" {
   role = aws_iam_role.ec2_role.name
 }
 
-locals {
-  instance_roles = ["monitoring", "application", "application"]
-}
-
 resource "aws_instance" "monitoring" {
-  count = var.instance_count
-
   ami                    = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
   key_name               = var.key_pair_name
-  subnet_id              = aws_subnet.public[count.index % length(aws_subnet.public)].id
+  subnet_id              = aws_subnet.public[0].id
   vpc_security_group_ids = [aws_security_group.monitoring.id]
   iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
 
@@ -108,17 +99,14 @@ resource "aws_instance" "monitoring" {
   }
 
   user_data = templatefile("${path.module}/templates/user-data.sh", {
-    instance_index = count.index + 1
-    instance_role  = local.instance_roles[count.index]
-    environment    = var.environment
-    loki_url       = "http://localhost:3100"
+    environment = var.environment
   })
 
   tags = {
-    Name        = "${var.project_name}-instance-${count.index + 1}"
-    Role        = local.instance_roles[count.index]
-    InstanceNum = tostring(count.index + 1)
-    AutoOff     = "true"
+    Name    = "${var.project_name}-server"
+    Project = var.project_name
+    Role    = "monitoring"
+    AutoOff = "true"
   }
 
   lifecycle {
@@ -127,16 +115,14 @@ resource "aws_instance" "monitoring" {
 }
 
 resource "aws_eip" "monitoring" {
-  count  = var.instance_count
   domain = "vpc"
 
   tags = {
-    Name = "${var.project_name}-eip-${count.index + 1}"
+    Name = "${var.project_name}-eip"
   }
 }
 
 resource "aws_eip_association" "monitoring" {
-  count         = var.instance_count
-  instance_id   = aws_instance.monitoring[count.index].id
-  allocation_id = aws_eip.monitoring[count.index].id
+  instance_id   = aws_instance.monitoring.id
+  allocation_id = aws_eip.monitoring.id
 }

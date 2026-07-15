@@ -1,24 +1,34 @@
-output "instance_ids" {
-  description = "IDs of EC2 instances"
-  value       = aws_instance.monitoring[*].id
+output "instance_id" {
+  description = "EC2 instance ID"
+  value       = aws_instance.monitoring.id
 }
 
-output "instance_public_ips" {
-  description = "Public IP addresses of EC2 instances"
-  value       = aws_eip.monitoring[*].public_ip
-}
-
-output "monitoring_server_ip" {
-  description = "Public IP of the monitoring server (instance 1)"
-  value       = aws_eip.monitoring[0].public_ip
+output "public_ip" {
+  description = "Public IP address"
+  value       = aws_eip.monitoring.public_ip
 }
 
 output "grafana_url" {
   description = "Grafana dashboard URL"
-  value       = "http://${aws_eip.monitoring[0].public_ip}:3001"
+  value       = "http://${aws_eip.monitoring.public_ip}:3001"
 }
 
-output "vpc_id" {
-  description = "ID of the VPC"
-  value       = aws_vpc.main.id
+output "app_url" {
+  description = "Node.js application URL"
+  value       = "http://${aws_eip.monitoring.public_ip}:3000"
+}
+
+output "prometheus_url" {
+  description = "Prometheus URL"
+  value       = "http://${aws_eip.monitoring.public_ip}:9090"
+}
+
+output "ssh_command" {
+  description = "SSH command"
+  value       = "ssh -i your-key.pem ubuntu@${aws_eip.monitoring.public_ip}"
+}
+
+output "ssm_command" {
+  description = "SSM connect command (no SSH key needed)"
+  value       = "aws ssm start-session --target ${aws_instance.monitoring.id} --region ${var.aws_region}"
 }

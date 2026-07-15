@@ -1,17 +1,17 @@
 variable "aws_region" {
-  description = "AWS region for all resources"
+  description = "AWS region"
   type        = string
   default     = "us-east-1"
 }
 
 variable "environment" {
-  description = "Environment name (dev, staging, production)"
+  description = "Environment name"
   type        = string
   default     = "dev"
 }
 
 variable "project_name" {
-  description = "Project name used for resource naming and tagging"
+  description = "Project name for resource naming"
   type        = string
   default     = "grafana-loki-monitoring"
 }
@@ -22,37 +22,31 @@ variable "instance_type" {
   default     = "t3.medium"
 }
 
-variable "instance_count" {
-  description = "Number of EC2 instances to create"
-  type        = number
-  default     = 3
-}
-
 variable "key_pair_name" {
-  description = "Name of the AWS key pair for SSH access"
+  description = "AWS key pair name for SSH access"
   type        = string
 }
 
 variable "vpc_cidr" {
-  description = "CIDR block for the VPC"
+  description = "VPC CIDR block"
   type        = string
   default     = "10.0.0.0/16"
 }
 
 variable "public_subnet_cidrs" {
-  description = "CIDR blocks for public subnets"
+  description = "Public subnet CIDR blocks"
   type        = list(string)
-  default     = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  default     = ["10.0.1.0/24"]
 }
 
 variable "allowed_ssh_cidrs" {
-  description = "CIDR blocks allowed for SSH access"
+  description = "CIDR blocks allowed for SSH"
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }
 
 variable "ami_id" {
-  description = "Specific AMI ID to use (leave empty for latest Ubuntu 22.04)"
+  description = "AMI ID (leave empty for latest Ubuntu 22.04)"
   type        = string
   default     = ""
 }
