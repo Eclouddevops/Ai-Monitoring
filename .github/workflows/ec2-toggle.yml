@@ -1,139 +1,110 @@
-name: EC2 Toggle
+name: "EC2 Start / Stop"
 
 on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'Action to perform on EC2 instances'
+        description: "Select Action"
         required: true
         type: choice
         options:
-          - start
-          - stop
-          - status
-      instance_selection:
-        description: 'Which instances to target'
-        required: true
-        default: 'all'
-        type: choice
-        options:
-          - all
-          - monitoring-only
-          - app-only
-          - instance-1
-          - instance-2
-          - instance-3
+          - START
+          - STOP
+          - STATUS
   schedule:
-    # Stop instances weekdays at 8:00 PM UTC
-    - cron: '0 20 * * 1-5'
-    # Start instances weekdays at 7:00 AM UTC
     - cron: '0 7 * * 1-5'
+    - cron: '0 20 * * 1-5'
 
 env:
   AWS_REGION: us-east-1
   PROJECT_TAG: grafana-loki-monitoring
 
 jobs:
-  ec2-toggle:
-    name: EC2 Instance Toggle
+  ec2-control:
+    name: "${{ github.event.inputs.action || 'Scheduled' }}"
     runs-on: ubuntu-latest
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
     steps:
-      - name: Determine Action
-        id: determine
+      - name: Determine action
+        id: config
         run: |
           if [ "${{ github.event_name }}" == "schedule" ]; then
-            # Check if this is the stop or start cron
             HOUR=$(date -u +%H)
-            if [ "$HOUR" -ge 18 ]; then
-              echo "action=stop" >> $GITHUB_OUTPUT
+            if [ "$HOUR" -lt 12 ]; then
+              echo "action=START" >> $GITHUB_OUTPUT
             else
-              echo "action=start" >> $GITHUB_OUTPUT
+              echo "action=STOP" >> $GITHUB_OUTPUT
             fi
-            echo "selection=all" >> $GITHUB_OUTPUT
           else
             echo "action=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
-            echo "selection=${{ github.event.inputs.instance_selection }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Get Instance IDs
-        id: instances
+      - name: Get instance
+        id: instance
         run: |
-          SELECTION="${{ steps.determine.outputs.selection }}"
-          
-          case "$SELECTION" in
-            "all")
-              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }}"
-              ;;
-            "monitoring-only")
-              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }} Name=tag:Role,Values=monitoring"
-              ;;
-            "app-only")
-              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }} Name=tag:Role,Values=application"
-              ;;
-            "instance-1")
-              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }} Name=tag:InstanceNum,Values=1"
-              ;;
-            "instance-2")
-              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }} Name=tag:InstanceNum,Values=2"
-              ;;
-            "instance-3")
-              FILTER="Name=tag:Project,Values=${{ env.PROJECT_TAG }} Name=tag:InstanceNum,Values=3"
-              ;;
-          esac
-          
-          INSTANCE_IDS=$(aws ec2 describe-instances \
+          INSTANCE_ID=$(aws ec2 describe-instances \
             --region ${{ env.AWS_REGION }} \
-            --filters $FILTER "Name=instance-state-name,Values=running,stopped" \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" "Name=instance-state-name,Values=running,stopped" \
             --query 'Reservations[].Instances[].InstanceId' \
             --output text)
           
-          echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
-          echo "Found instances: $INSTANCE_IDS"
-
-      - name: Start Instances
-        if: steps.determine.outputs.action == 'start' && steps.instances.outputs.instance_ids != ''
-        run: |
-          echo "Starting instances: ${{ steps.instances.outputs.instance_ids }}"
-          aws ec2 start-instances \
+          STATE=$(aws ec2 describe-instances \
             --region ${{ env.AWS_REGION }} \
-            --instance-ids ${{ steps.instances.outputs.instance_ids }}
-          echo "✅ Instances started successfully"
-
-      - name: Stop Instances
-        if: steps.determine.outputs.action == 'stop' && steps.instances.outputs.instance_ids != ''
-        run: |
-          echo "Stopping instances: ${{ steps.instances.outputs.instance_ids }}"
-          aws ec2 stop-instances \
-            --region ${{ env.AWS_REGION }} \
-            --instance-ids ${{ steps.instances.outputs.instance_ids }}
-          echo "✅ Instances stopped successfully"
-
-      - name: Check Status
-        if: steps.determine.outputs.action == 'status'
-        run: |
-          echo "## EC2 Instance Status" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[].Instances[].State.Name' \
+            --output text 2>/dev/null || echo "unknown")
           
+          IP=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[].Instances[].PublicIpAddress' \
+            --output text 2>/dev/null || echo "N/A")
+          
+          echo "id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "state=$STATE" >> $GITHUB_OUTPUT
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+      - name: START
+        if: steps.config.outputs.action == 'START'
+        run: |
+          if [ "${{ steps.instance.outputs.state }}" == "running" ]; then
+            echo "Already running! Access: http://${{ steps.instance.outputs.ip }}:3001"
+            exit 0
+          fi
+          aws ec2 start-instances --region ${{ env.AWS_REGION }} --instance-ids ${{ steps.instance.outputs.id }}
+          aws ec2 wait instance-running --region ${{ env.AWS_REGION }} --instance-ids ${{ steps.instance.outputs.id }}
+          IP=$(aws ec2 describe-instances --region ${{ env.AWS_REGION }} --instance-ids ${{ steps.instance.outputs.id }} --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+          echo "STARTED! Grafana: http://$IP:3001 | App: http://$IP:3000"
+
+      - name: STOP
+        if: steps.config.outputs.action == 'STOP'
+        run: |
+          if [ "${{ steps.instance.outputs.state }}" == "stopped" ]; then
+            echo "Already stopped!"
+            exit 0
+          fi
+          aws ec2 stop-instances --region ${{ env.AWS_REGION }} --instance-ids ${{ steps.instance.outputs.id }}
+          aws ec2 wait instance-stopped --region ${{ env.AWS_REGION }} --instance-ids ${{ steps.instance.outputs.id }}
+          echo "STOPPED! Compute charges paused."
+
+      - name: STATUS
+        if: steps.config.outputs.action == 'STATUS'
+        run: |
           aws ec2 describe-instances \
             --region ${{ env.AWS_REGION }} \
             --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
-            --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,Type:InstanceType,Name:Tags[?Key==`Name`].Value|[0],Role:Tags[?Key==`Role`].Value|[0]}' \
+            --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],InstanceId,State.Name,PublicIpAddress]' \
             --output table
-          
-          aws ec2 describe-instances \
-            --region ${{ env.AWS_REGION }} \
-            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
-            --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,Name:Tags[?Key==`Name`].Value|[0],Role:Tags[?Key==`Role`].Value|[0]}' \
-            --output json | jq -r '.[] | "| \(.Name) | \(.ID) | \(.State) | \(.Role) |"' >> $GITHUB_STEP_SUMMARY
 
       - name: Summary
+        if: always()
         run: |
-          echo "## EC2 Toggle Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Action:** ${{ steps.determine.outputs.action }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Selection:** ${{ steps.determine.outputs.selection }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Instances:** ${{ steps.instances.outputs.instance_ids }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "## EC2 ${{ steps.config.outputs.action }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | ${{ steps.config.outputs.action }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Instance | ${{ steps.instance.outputs.id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| IP | ${{ steps.instance.outputs.ip }} |" >> $GITHUB_STEP_SUMMARY
