@@ -70,7 +70,7 @@ services:
 
   nodejs-app:
     build:
-      context: ../nodejs-app
+      context: ./nodejs-app
       dockerfile: Dockerfile
     container_name: nodejs-app
     ports:
