@@ -221,6 +221,23 @@ jobs:
         working-directory: terraform
         run: terraform init
 
+      - name: Force unlock state (if locked)
+        working-directory: terraform
+        run: |
+          # Get lock ID from DynamoDB if locked
+          LOCK_ID=$(aws dynamodb get-item \
+            --table-name ai-monitoring-tf-locks \
+            --key '{"LockID":{"S":"ai-monitoring-tfstate-496251222247/terraform.tfstate"}}' \
+            --region us-east-1 \
+            --query 'Item.Info.S' --output text 2>/dev/null | jq -r '.ID' 2>/dev/null || echo "")
+          
+          if [ -n "$LOCK_ID" ] && [ "$LOCK_ID" != "null" ] && [ "$LOCK_ID" != "" ]; then
+            echo "Found stale lock: $LOCK_ID — force unlocking..."
+            terraform force-unlock -force "$LOCK_ID"
+          else
+            echo "No lock found, proceeding..."
+          fi
+
       - name: Terraform Destroy
         working-directory: terraform
         run: terraform destroy -auto-approve -lock=false
